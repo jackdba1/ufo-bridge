@@ -11,7 +11,7 @@ import websockets
 
 UFO_ROOT = os.environ.get("UFO_ROOT", r"C:\UFO")
 VENV_PY  = os.environ.get("UFO_VENV", r"C:\UFO\.venv\Scripts\python.exe")
-PORT     = int(os.environ.get("UFO_BRIDGE_PORT", "8099"))
+PORT     = int(os.environ.get("UFO_BRIDGE_PORT", "8199"))
 DEVICE_ID = "ufo2_bridge"
 
 # ── Helpers ──

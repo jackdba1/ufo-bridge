@@ -10,7 +10,7 @@ let pythonProcess = null;
 // ── Config ──
 const PYTHON = 'C:\\UFO\\.venv\\Scripts\\python.exe';
 const SERVER  = path.join(__dirname, 'server', 'server.py');
-const PORT    = 8099;
+const PORT    = 8199;
 const isDev   = process.argv.includes('--dev');
 
 // ── Python server lifecycle ──

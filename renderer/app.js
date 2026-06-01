@@ -29,7 +29,7 @@ const particles = [];
 // ── WebSocket ──
 
 async function connect() {
-  const port = (window.bridge && await window.bridge.getPort()) || 8099;
+  const port = (window.bridge && await window.bridge.getPort()) || 8199;
   const url = `ws://127.0.0.1:${port}/ws?token=bridge`;
 
   ws = new WebSocket(url);
