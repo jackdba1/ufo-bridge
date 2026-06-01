@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>⬡ UFO² COMMAND BRIDGE</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,300;0,400;0,700;1,400&family=VT323&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div id="titlebar">
+  <div class="tb-drag">
+    <span class="tb-brand">⬡ UFO² COMMAND BRIDGE</span>
+  </div>
+  <div class="tb-actions">
+    <span class="tb-stat" id="tb-sessions">0</span>
+    <span class="tb-stat" id="tb-lines">0</span>
+    <span class="tb-clock" id="tb-clock">00:00:00</span>
+    <div class="tb-btns">
+      <button class="tb-btn" id="btn-min" title="Minimize" onclick="bridge.minimize()">─</button>
+      <button class="tb-btn" id="btn-max" title="Maximize" onclick="bridge.maximize()">□</button>
+      <button class="tb-btn tb-close" id="btn-close" title="Close" onclick="bridge.close()">✕</button>
+    </div>
+  </div>
+</div>
+
+<canvas id="bg-canvas"></canvas>
+
+<div id="app">
+  <div id="log-panel">
+    <div class="panel-label">◉ MISSION LOG</div>
+    <div id="log"></div>
+    <div id="load-bar"><span class="pulse">████</span> PROCESSING<span id="load-blink">▌</span></div>
+  </div>
+
+  <div id="sidebar">
+    <div class="card">
+      <h3>◉ STATUS</h3>
+      <div class="row"><span class="l">Agent</span><span class="v" id="s-agent">—</span></div>
+      <div class="row"><span class="l">State</span><span class="v"><span id="status-led"></span> <span id="s-state">IDLE</span></span></div>
+      <div class="row"><span class="l">Model</span><span class="v">Gemini Flash</span></div>
+      <div class="row"><span class="l">Cost</span><span class="v">FREE</span></div>
+    </div>
+    <div class="card">
+      <h3>⬡ CAPABILITIES</h3>
+      <div class="cap">Windows Apps</div>
+      <div class="cap">File Management</div>
+      <div class="cap">Web Browsing</div>
+      <div class="cap">Shell Commands</div>
+      <div class="cap">Screenshots</div>
+      <div class="cap">UIA Control</div>
+    </div>
+    <div class="card">
+      <h3>⚙︎ LOAD</h3>
+      <canvas id="gauge-canvas"></canvas>
+      <div id="sparkline"></div>
+    </div>
+  </div>
+
+  <div id="cmd-bar">
+    <div class="panel-label">▸ REQUEST</div>
+    <input id="cmd-input" type="text" placeholder="Open Notepad and type hello world..." autocomplete="off" spellcheck="false">
+    <button id="btn-send">SEND</button>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
