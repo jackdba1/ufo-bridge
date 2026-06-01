@@ -24,7 +24,7 @@ log = logging.getLogger("bridge")
 # ── Config ──
 UFO_ROOT  = os.environ.get("UFO_ROOT",  r"C:\UFO")
 VENV_PY   = os.environ.get("UFO_VENV",  r"C:\UFO\.venv\Scripts\python.exe")
-PORT      = int(os.environ.get("UFO_BRIDGE_PORT", "8199"))
+PORT      = int(os.environ.get("UFO_BRIDGE_PORT", "5099"))
 DEVICE_ID = os.environ.get("BRIDGE_DEVICE_ID", "ufo2_bridge")
 AUTH_TOKEN = os.environ.get("BRIDGE_TOKEN", "")   # H4 — empty = no auth
 
