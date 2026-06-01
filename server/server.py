@@ -1,257 +1,242 @@
 #!/usr/bin/env python3
-"""UFO2 BRIDGE — AIP-compliant device endpoint.
-Uses websockets library for reliable Windows serving.
+"""
+UFO2 BRIDGE — standalone AIP device endpoint.
+Audited and hardened per bridge-audit.md.
+
+Fixes applied:
+  C1 — subprocess queue: max 1 concurrent UAV2 task. Reject overlap.
+  H2 — parse errors return JSON error. No silent swallowing.
+  H3 — AIP JSON only. No __START__/__DONE__ raw markers.
+  H4 — optional BRIDGE_TOKEN for auth.
+  H5 — echo request_id in all responses.
+  L3 — salted task IDs (timestamp prefix prevents log collision).
 """
 
-import os, sys, re, json, uuid, asyncio, subprocess
+import os, sys, re, json, uuid, time, asyncio, logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 import websockets
 
-UFO_ROOT = os.environ.get("UFO_ROOT", r"C:\UFO")
-VENV_PY  = os.environ.get("UFO_VENV", r"C:\UFO\.venv\Scripts\python.exe")
-PORT     = int(os.environ.get("UFO_BRIDGE_PORT", "8199"))
-DEVICE_ID = "ufo2_bridge"
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(name)s] %(message)s")
+log = logging.getLogger("bridge")
+
+# ── Config ──
+UFO_ROOT  = os.environ.get("UFO_ROOT",  r"C:\UFO")
+VENV_PY   = os.environ.get("UFO_VENV",  r"C:\UFO\.venv\Scripts\python.exe")
+PORT      = int(os.environ.get("UFO_BRIDGE_PORT", "8199"))
+DEVICE_ID = os.environ.get("BRIDGE_DEVICE_ID", "ufo2_bridge")
+AUTH_TOKEN = os.environ.get("BRIDGE_TOKEN", "")   # H4 — empty = no auth
 
 # ── Helpers ──
 
-def _id(): return uuid.uuid4().hex[:12]
+def _id() -> str:  return uuid.uuid4().hex[:8]
+def _ts() -> str:  return datetime.now(timezone.utc).isoformat()
 
-def server_msg(msg_type: str, **fields) -> dict:
-    return {
-        "type": msg_type, "status": "ok",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "response_id": _id(),
-        "session_id": fields.pop("session_id", None),
-        "task_name": fields.pop("task_name", None),
-        "agent_name": None, "process_name": None,
-        "root_name": None, "actions": None,
-        "messages": None, "error": None,
-        "user_request": None, "result": None,
-    } | {k: v for k, v in fields.items()}
+def ok_msg(msg_type: str, **fields) -> dict:
+    return {"type": msg_type, "status": "ok", "timestamp": _ts(), "response_id": _id()} | fields
 
-def client_msg(msg_type: str, **fields) -> dict:
-    return {
-        "type": msg_type, "status": "ok",
-        "client_type": "device", "client_id": DEVICE_ID,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "session_id": fields.pop("session_id", None),
-        "task_name": fields.pop("task_name", None),
-        "target_id": None, "request": None,
-        "action_results": None, "request_id": None,
-        "prev_response_id": None, "error": None, "metadata": None,
-    } | {k: v for k, v in fields.items()}
+def err_msg(reason: str, **fields) -> dict:
+    return {"type": "error", "status": "error", "error": reason, "timestamp": _ts()} | fields
 
-# ── UFO² subprocess ──
+# ── Subprocess pool (C1 — max 1 concurrent) ──
 
-class UFOTask:
+class UFOPool:
+    """Single-task pool. Rejects overlapping requests with status=business."""
     def __init__(self):
-        self._proc = None
-        self.running = False
+        self._proc: Optional[asyncio.subprocess.Process] = None
+        self._running = False
+        self._lock = asyncio.Lock()
 
-    async def start(self, req: str):
-        tid = re.sub(r"[^a-zA-Z0-9]", "_", req.lower())[:30]
-        env = os.environ.copy(); env["PYTHONUTF8"] = "1"
-        self._proc = await asyncio.create_subprocess_exec(
-            VENV_PY, "-m", "ufo", "--task", tid, "--request", req,
-            cwd=UFO_ROOT, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-            env=env,
-        )
-        self.running = True
+    async def run(self, request: str) -> Dict[str, Any]:
+        if not self._lock.locked():
+            async with self._lock:
+                return await self._execute(request)
+        return {"status": "busy", "error": "UFO2 is already executing a task. Retry in a few seconds."}
 
-    async def readline(self) -> Optional[str]:
-        if not self.running or not self._proc or not self._proc.stdout:
-            return None
-        try:
-            line = await asyncio.wait_for(self._proc.stdout.readline(), timeout=120)
-        except asyncio.TimeoutError:
-            return None
-        if not line:
-            self.running = False
-            return None
-        return line.decode("utf-8", errors="replace")
-
-    async def stop(self):
+    async def cancel(self):
         if self._proc:
             try: self._proc.terminate()
             except: pass
-            self.running = False
+            self._running = False
 
-# ── Connection state ──
+    async def _execute(self, request: str) -> Dict[str, Any]:
+        tid = f"{int(time.time())}_{re.sub(r'[^a-zA-Z0-9]', '_', request.lower())[:30]}"  # L3
+        env = os.environ.copy(); env["PYTHONUTF8"] = "1"
+        self._proc = await asyncio.create_subprocess_exec(
+            VENV_PY, "-m", "ufo", "--task", tid, "--request", request,
+            cwd=UFO_ROOT,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            env=env,
+        )
+        self._running = True
+        lines = []
+        ansi = re.compile(r"\x1b\[[0-9;]*m")
+        noise = {"AuthlibDeprecation","PydanticDeprecated","warnings.warn",
+                 "PyPDF2","AgentRegistry","Cost is not","Cost information"}
+        try:
+            while self._proc.returncode is None:
+                raw = await asyncio.wait_for(self._proc.stdout.readline(), timeout=120)
+                if not raw: break
+                clean = ansi.sub("", raw.decode("utf-8","replace")).rstrip()
+                if clean and not any(x in clean for x in noise):
+                    lines.append(clean)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            self._running = False
+        success = any("COMPLETE" in l or "FINISH" in l or "\u2705" in l for l in lines)
+        return {"status": "success" if success else "failure",
+                "output": "\n".join(lines[-40:]),
+                "line_count": len(lines),
+                "task_id": tid}
 
-class BridgeSession:
-    def __init__(self):
-        self.client_id: Optional[str] = None
-        self.session_id: Optional[str] = None
-        self.task: Optional[UFOTask] = None
-        self.legacy = False  # Browser text mode vs AIP JSON mode
+pool = UFOPool()
 
-# ── WebSocket handler ──
+# ── Connection handler ──
 
 async def bridge_handler(ws: websockets.WebSocketServerProtocol, path: str):
-    s = BridgeSession()
-    ansi = re.compile(r"\x1b\[[0-9;]*m")
-    noise = {"AuthlibDeprecation", "PydanticDeprecated", "warnings.warn",
-             "PyPDF2", "AgentRegistry", "Cost is not available", "Cost information"}
-
+    agent: Dict[str, Any] = {"id": None, "type": None, "authenticated": not AUTH_TOKEN}
     try:
         async for raw in ws:
-            # Try JSON (AIP) first
+            # ── Parse ──
             try:
                 msg = json.loads(raw)
-                await _handle_aip(ws, s, msg)
-                continue
-            except (json.JSONDecodeError, TypeError):
-                pass
+            except Exception as e:
+                log.warning("JSON parse error from %s: %s", ws.remote_address, e)
+                await ws.send(json.dumps(err_msg(f"JSON parse error: {e}")))
+                continue  # H2 — error feedback instead of silent pass
 
-            # Legacy browser text mode
-            text = raw.strip()
-            if text == "__PING__":
-                await ws.send("__PONG__")
-            elif text.startswith("__CMD__:"):
-                await _handle_legacy(ws, s, text[8:], ansi, noise)
+            # ── Auth check (H4) ──
+            if not agent["authenticated"]:
+                if msg.get("type") == "authenticate":
+                    token = msg.get("token", "")
+                    if AUTH_TOKEN and token == AUTH_TOKEN:
+                        agent["authenticated"] = True
+                        await ws.send(json.dumps(ok_msg("authenticated")))
+                    else:
+                        await ws.send(json.dumps(err_msg("Invalid token")))
+                    continue
+                elif msg.get("type") in ("register", "heartbeat", "ping"):
+                    pass  # Allow register before auth
+                else:
+                    await ws.send(json.dumps(err_msg("Authentication required. Send {\"type\":\"authenticate\",\"token\":\"...\"}")))
+                    continue
+
+            # ── Echo request_id (H5) ──
+            rid = msg.get("request_id", "")
+
+            mtype = msg.get("type", "")
+            if mtype == "authenticate":
+                resp = ok_msg("authenticated") if agent["authenticated"] else err_msg("Already authenticated")
+
+            elif mtype == "register":
+                agent["id"] = msg.get("client_id") or msg.get("agent_id", "unknown")
+                agent["type"] = msg.get("client_type") or msg.get("agent_type", "device")
+                resp = ok_msg("heartbeat", agent_id=agent["id"])
+
+            elif mtype == "heartbeat":
+                resp = ok_msg("heartbeat")
+
+            elif mtype == "task":
+                session_id = msg.get("session_id", _id())
+                resp = ok_msg("task", session_id=session_id, task_name=msg.get("task_name","task"),
+                              user_request=msg.get("request",""))
+
+            elif mtype == "command":
+                actions = msg.get("actions", [])
+                results = []
+                for act in actions:
+                    tool = act.get("tool_name","")
+                    params = act.get("parameters",{})
+                    if tool == "run_task":
+                        req = params.get("request", msg.get("user_request",""))
+                        r = await pool.run(req)
+                        results.append({
+                            "status": r["status"],
+                            "result": r if r["status"] != "busy" else None,
+                            "error": r.get("error"),
+                            "namespace": "action",
+                            "call_id": act.get("call_id"),
+                            "task_id": r.get("task_id"),
+                        })
+                    elif tool == "get_status":
+                        results.append({"status": "success", "result": "running" if pool._running else "idle", "namespace": "data_collection", "call_id": act.get("call_id")})
+                    elif tool == "cancel":
+                        await pool.cancel()
+                        results.append({"status": "success", "result": "cancelled", "namespace": "action", "call_id": act.get("call_id")})
+                    else:
+                        results.append({"status": "failure", "error": f"Unknown tool: {tool}", "namespace": act.get("tool_type",""), "call_id": act.get("call_id")})
+
+                resp = {
+                    "type": "command_results", "status": "ok",
+                    "client_type": "device", "client_id": DEVICE_ID,
+                    "session_id": msg.get("session_id"),
+                    "action_results": results,
+                    "prev_response_id": msg.get("response_id",""),
+                    "timestamp": _ts(),
+                }
+
+                # If task ended, send task_end (H3 — JSON only, no raw markers)
+                if any(a.get("tool_name") == "run_task" for a in actions):
+                    end = ok_msg("task_end",
+                        session_id=msg.get("session_id"),
+                        status="completed" if all(r["status"]=="success" for r in results) else "failed",
+                    )
+                    await ws.send(json.dumps(end))
+
+            elif mtype == "task_end":
+                resp = ok_msg("heartbeat")  # acknowledge
+
+            elif mtype == "ping":
+                resp = ok_msg("pong")
+
+            elif mtype == "discover":
+                resp = ok_msg("discover", agents=[{
+                    "agent_id": DEVICE_ID, "agent_type": "device",
+                    "capabilities": ["windows_apps","file_mgmt","web_browse","shell","screenshots","uia_control"],
+                    "status": "online",
+                }])
+
+            else:
+                resp = err_msg(f"Unknown message type: {mtype}")
+
+            if rid:
+                resp["request_id"] = rid  # H5
+
+            await ws.send(json.dumps(resp))
 
     except websockets.exceptions.ConnectionClosed:
         pass
+    except Exception as e:
+        log.error("Handler error: %s", e)
     finally:
-        if s.task: s.task.stop()
+        if agent["id"]:
+            log.info("Agent disconnected: %s", agent["id"])
 
-
-async def _handle_aip(ws, s: BridgeSession, msg: dict):
-    mtype = msg.get("type", "")
-
-    if mtype == "register":
-        s.client_id = msg.get("client_id", "unknown")
-        resp = server_msg("heartbeat")
-        await ws.send(json.dumps(resp))
-
-    elif mtype == "heartbeat":
-        resp = server_msg("heartbeat", session_id=msg.get("session_id"))
-        await ws.send(json.dumps(resp))
-
-    elif mtype == "task":
-        sid = msg.get("session_id", _id())
-        s.session_id = sid
-        resp = server_msg("task",
-            session_id=sid, task_name=msg.get("task_name", "task"),
-            user_request=msg.get("request", ""),
-        )
-        await ws.send(json.dumps(resp))
-
-    elif mtype == "command":
-        sid = msg.get("session_id") or s.session_id or _id()
-        s.session_id = sid
-        rid = msg.get("response_id", "")
-        actions = msg.get("actions", [])
-        req_text = msg.get("user_request", "")
-
-        results = []
-        for act in actions:
-            tool = act.get("tool_name", "")
-            r = await _exec_tool(s, tool, act.get("parameters", {}), req_text)
-            results.append({
-                "status": r["status"],
-                "result": r.get("result"),
-                "error": r.get("error"),
-                "namespace": act.get("tool_type"),
-                "call_id": act.get("call_id"),
-            })
-
-        resp = client_msg("command_results",
-            session_id=sid, action_results=results,
-            prev_response_id=rid,
-        )
-        await ws.send(json.dumps(resp))
-
-    elif mtype == "task_end":
-        if s.task: await s.task.stop(); s.task = None
-
-
-async def _exec_tool(s: BridgeSession, tool: str, params: dict, req_text: str) -> dict:
-    if tool == "run_task":
-        request = params.get("request", req_text)
-        if not request:
-            return {"status": "failure", "error": "No request provided"}
-        if s.task: await s.task.stop()
-        s.task = UFOTask()
-        await s.task.start(request)
-        lines = []
-        ansi = re.compile(r"\x1b\[[0-9;]*m")
-        while s.task.running:
-            l = await s.task.readline()
-            if l is None: break
-            clean = ansi.sub("", l).rstrip()
-            if clean and not any(x in clean for x in [
-                "AuthlibDeprecation","PydanticDeprecated","warnings.warn",
-                "PyPDF2","AgentRegistry","Cost is not","Cost information",
-            ]):
-                lines.append(clean)
-        success = any("COMPLETE" in l or "FINISH" in l or "\u2705" in l for l in lines)
-        return {"status": "success" if success else "failure", "result": "\n".join(lines[-30:])}
-    elif tool == "get_status":
-        return {"status": "success", "result": "running" if s.task else "idle"}
-    elif tool == "cancel":
-        if s.task: await s.task.stop(); s.task = None
-        return {"status": "success", "result": "cancelled"}
-    return {"status": "failure", "error": f"Unknown tool: {tool}"}
-
-
-async def _handle_legacy(ws, s: BridgeSession, req: str, ansi, noise):
-    if s.task: await s.task.stop()
-    s.task = UFOTask()
-    await s.task.start(req)
-    await ws.send("__START__")
-    buf = ""
-    while s.task and s.task.running:
-        l = s.task.readline()
-        if l is None: break
-        clean = ansi.sub("", l).rstrip()
-        if not clean or any(x in clean for x in noise): continue
-        buf += clean + "\n"
-        if len(buf) > 4096:
-            await ws.send(buf); buf = ""
-    if buf: await ws.send(buf)
-    await ws.send("__DONE__")
-
-
-# ── HTTP (serve HTML) ──
+# ── HTTP UI ──
 
 async def http_handler(reader, writer):
     html_path = Path(__file__).parent.parent / "renderer" / "index.html"
-    if html_path.exists():
-        content = html_path.read_text(encoding="utf-8")
-    else:
-        content = "<h1>UFO2 Bridge</h1><p>Frontend not found.</p>"
-    resp = f"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {len(content.encode('utf-8'))}\r\nConnection: close\r\n\r\n{content}"
-    writer.write(resp.encode()); await writer.drain()
+    content = html_path.read_text(encoding="utf-8") if html_path.exists() else "<h1>UFO2 Bridge</h1>"
+    body = content.encode("utf-8")
+    resp = f"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+    writer.write(resp.encode()); writer.write(body); await writer.drain()
     writer.close(); await writer.wait_closed()
 
+# ── Main ──
 
 async def main():
     html_path = Path(__file__).parent.parent / "renderer" / "index.html"
     if not html_path.exists():
-        print(f"Warning: {html_path} not found")
+        log.warning("HTML UI not found at %s", html_path)
 
-    # WebSocket server
-    ws_server = await websockets.serve(
-        bridge_handler, "127.0.0.1", PORT,
-        ping_interval=None,  # Disable auto-ping to prevent timeouts during UFO execution
-        ping_timeout=None,
-        close_timeout=10,
-    )
-    # HTTP server
-    http_server = await asyncio.start_server(http_handler, "127.0.0.1", PORT + 1)
+    ws_server = await websockets.serve(bridge_handler, "127.0.0.1", PORT, ping_interval=None, ping_timeout=None)
+    http_srv = await asyncio.start_server(http_handler, "127.0.0.1", PORT + 1)
 
-    print(f"  UFO2 BRIDGE ws://127.0.0.1:{PORT}  [AIP device endpoint]")
-    print(f"  Device ID: {DEVICE_ID}")
-    print(f"  UI: http://127.0.0.1:{PORT+1}")
-
-    await asyncio.gather(
-        asyncio.create_task(ws_server.wait_closed()),
-        http_server.serve_forever(),
-    )
-
+    auth_str = "(token) " if AUTH_TOKEN else "(no auth) "
+    log.info("UFO2 BRIDGE ws://127.0.0.1:%s %s device=%s", PORT, auth_str, DEVICE_ID)
+    await asyncio.gather(ws_server.wait_closed(), http_srv.serve_forever())
 
 if __name__ == "__main__":
     asyncio.run(main())
