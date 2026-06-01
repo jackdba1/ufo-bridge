@@ -1,286 +1,257 @@
 #!/usr/bin/env python3
-"""UFO2 BRIDGE — thin WebSocket backend.
-Streams UFO2 stdout to the fake-TUI frontend in real time.
+"""UFO2 BRIDGE — AIP-compliant device endpoint.
+Uses websockets library for reliable Windows serving.
 """
 
-import os
-import sys
-import re
-import json
-import asyncio
-import subprocess
+import os, sys, re, json, uuid, asyncio, subprocess
+from datetime import datetime, timezone
 from pathlib import Path
-from datetime import datetime
+from typing import Optional
+import websockets
 
 UFO_ROOT = os.environ.get("UFO_ROOT", r"C:\UFO")
-VENV_PY = os.environ.get("UFO_VENV", r"C:\UFO\.venv\Scripts\python.exe")
-PORT = int(os.environ.get("UFO_BRIDGE_PORT", "8099"))
+VENV_PY  = os.environ.get("UFO_VENV", r"C:\UFO\.venv\Scripts\python.exe")
+PORT     = int(os.environ.get("UFO_BRIDGE_PORT", "8099"))
+DEVICE_ID = "ufo2_bridge"
 
-HTTP_HTML = """\
-HTTP/1.1 200 OK\r
-Content-Type: text/html; charset=utf-8\r
-Connection: close\r
-\r
-"""
+# ── Helpers ──
 
-# ── UFO² subprocess wrapper ──
+def _id(): return uuid.uuid4().hex[:12]
+
+def server_msg(msg_type: str, **fields) -> dict:
+    return {
+        "type": msg_type, "status": "ok",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "response_id": _id(),
+        "session_id": fields.pop("session_id", None),
+        "task_name": fields.pop("task_name", None),
+        "agent_name": None, "process_name": None,
+        "root_name": None, "actions": None,
+        "messages": None, "error": None,
+        "user_request": None, "result": None,
+    } | {k: v for k, v in fields.items()}
+
+def client_msg(msg_type: str, **fields) -> dict:
+    return {
+        "type": msg_type, "status": "ok",
+        "client_type": "device", "client_id": DEVICE_ID,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "session_id": fields.pop("session_id", None),
+        "task_name": fields.pop("task_name", None),
+        "target_id": None, "request": None,
+        "action_results": None, "request_id": None,
+        "prev_response_id": None, "error": None, "metadata": None,
+    } | {k: v for k, v in fields.items()}
+
+# ── UFO² subprocess ──
 
 class UFOTask:
-    def __init__(self, request: str):
-        tid = re.sub(r"[^a-zA-Z0-9]", "_", request.lower())[:30]
-        env = os.environ.copy()
-        env["PYTHONUTF8"] = "1"
-        env["PYTHONIOENCODING"] = "utf-8"
-        self._proc = subprocess.Popen(
-            [VENV_PY, "-m", "ufo", "--task", tid, "--request", request],
-            cwd=UFO_ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace",
+    def __init__(self):
+        self._proc = None
+        self.running = False
+
+    async def start(self, req: str):
+        tid = re.sub(r"[^a-zA-Z0-9]", "_", req.lower())[:30]
+        env = os.environ.copy(); env["PYTHONUTF8"] = "1"
+        self._proc = await asyncio.create_subprocess_exec(
+            VENV_PY, "-m", "ufo", "--task", tid, "--request", req,
+            cwd=UFO_ROOT, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
             env=env,
         )
         self.running = True
 
-    def readline(self) -> str | None:
-        if not self.running:
+    async def readline(self) -> Optional[str]:
+        if not self.running or not self._proc or not self._proc.stdout:
             return None
-        assert self._proc.stdout
-        line = self._proc.stdout.readline()
-        if not line and self._proc.poll() is not None:
+        try:
+            line = await asyncio.wait_for(self._proc.stdout.readline(), timeout=120)
+        except asyncio.TimeoutError:
+            return None
+        if not line:
             self.running = False
             return None
-        return line
+        return line.decode("utf-8", errors="replace")
 
-    def stop(self):
+    async def stop(self):
         if self._proc:
-            try:
-                self._proc.terminate()
-            except Exception:
-                pass
+            try: self._proc.terminate()
+            except: pass
             self.running = False
 
+# ── Connection state ──
+
+class BridgeSession:
+    def __init__(self):
+        self.client_id: Optional[str] = None
+        self.session_id: Optional[str] = None
+        self.task: Optional[UFOTask] = None
+        self.legacy = False  # Browser text mode vs AIP JSON mode
 
 # ── WebSocket handler ──
 
-class BridgeProtocol:
-    """Custom WebSocket-like protocol over raw TCP for zero-dependency server."""
+async def bridge_handler(ws: websockets.WebSocketServerProtocol, path: str):
+    s = BridgeSession()
+    ansi = re.compile(r"\x1b\[[0-9;]*m")
+    noise = {"AuthlibDeprecation", "PydanticDeprecated", "warnings.warn",
+             "PyPDF2", "AgentRegistry", "Cost is not available", "Cost information"}
 
-    def __init__(self, reader, writer):
-        self.reader = reader
-        self.writer = writer
-        self._ufo: UFOTask | None = None
-
-    async def handle(self):
-        try:
-            data = await self.reader.readline()
-            if not data:
-                return
-            data = data.decode("utf-8", errors="replace").strip()
-
-            # Handle HTTP upgrade request
-            if data.startswith("GET "):
-                await self._http_handshake(data)
-                return
-
-            # Raw WebSocket frame — we do minimal framing
-            # All frames are text from the browser
-            self._ufo = None
-            while True:
-                frame = await self._read_frame()
-                if frame is None:
-                    break
-                msg = frame.decode("utf-8", errors="replace").strip()
-                if msg == "__PING__":
-                    await self._send_text("__PONG__")
-                elif msg.startswith("__CMD__:"):
-                    request = msg[8:]
-                    self._ufo = UFOTask(request)
-                    asyncio.create_task(self._stream_ufo())
-        except Exception:
-            pass
-        finally:
-            if self._ufo:
-                self._ufo.stop()
+    try:
+        async for raw in ws:
+            # Try JSON (AIP) first
             try:
-                self.writer.close()
-            except Exception:
+                msg = json.loads(raw)
+                await _handle_aip(ws, s, msg)
+                continue
+            except (json.JSONDecodeError, TypeError):
                 pass
 
-    async def _http_handshake(self, first_line: str):
-        # Read all headers
-        headers = {}
-        while True:
-            line = await self.reader.readline()
-            line = line.decode("utf-8", errors="replace").strip()
-            if not line:
-                break
-            if ":" in line:
-                k, v = line.split(":", 1)
-                headers[k.strip().lower()] = v.strip()
+            # Legacy browser text mode
+            text = raw.strip()
+            if text == "__PING__":
+                await ws.send("__PONG__")
+            elif text.startswith("__CMD__:"):
+                await _handle_legacy(ws, s, text[8:], ansi, noise)
 
-        # If WebSocket upgrade
-        if headers.get("upgrade", "").lower() == "websocket":
-            key = headers.get("sec-websocket-key", "")
-            accept = self._ws_accept(key)
-            resp = (
-                "HTTP/1.1 101 Switching Protocols\r\n"
-                "Upgrade: websocket\r\n"
-                "Connection: Upgrade\r\n"
-                f"Sec-WebSocket-Accept: {accept}\r\n"
-                "\r\n"
-            )
-            self.writer.write(resp.encode())
-            await self.writer.drain()
-            # Continue to message loop
-            await self._ws_loop()
-        else:
-            # Serve the HTML file
-            html_path = Path(__file__).parent.parent / "renderer" / "index.html"
-            if html_path.exists():
-                content = html_path.read_text(encoding="utf-8")
-            else:
-                content = "<h1>UFO2 Bridge</h1><p>Frontend not found.</p>"
-            resp = HTTP_HTML + content
-            self.writer.write(resp.encode())
-            await self.writer.drain()
-            self.writer.close()
+    except websockets.exceptions.ConnectionClosed:
+        pass
+    finally:
+        if s.task: s.task.stop()
 
-    async def _ws_loop(self):
-        try:
-            while True:
-                frame = await self._read_frame()
-                if frame is None:
-                    break
-                msg = frame.decode("utf-8", errors="replace").strip()
-                if msg == "__PING__":
-                    await self._send_text("__PONG__")
-                elif msg.startswith("__CMD__:"):
-                    if self._ufo:
-                        self._ufo.stop()
-                    request = msg[8:]
-                    self._ufo = UFOTask(request)
-                    asyncio.create_task(self._stream_ufo())
-        except Exception:
-            pass
 
-    async def _read_frame(self) -> bytes | None:
-        try:
-            header = await self.reader.readexactly(2)
-        except Exception:
-            return None
-        b0, b1 = header[0], header[1]
-        fin = (b0 & 0x80) != 0
-        opcode = b0 & 0x0F
-        masked = (b1 & 0x80) != 0
-        length = b1 & 0x7F
+async def _handle_aip(ws, s: BridgeSession, msg: dict):
+    mtype = msg.get("type", "")
 
-        if length == 126:
-            try:
-                ext = await self.reader.readexactly(2)
-            except Exception:
-                return None
-            length = int.from_bytes(ext, "big")
-        elif length == 127:
-            try:
-                ext = await self.reader.readexactly(8)
-            except Exception:
-                return None
-            length = int.from_bytes(ext, "big")
+    if mtype == "register":
+        s.client_id = msg.get("client_id", "unknown")
+        resp = server_msg("heartbeat")
+        await ws.send(json.dumps(resp))
 
-        mask_key = None
-        if masked:
-            try:
-                mask_key = await self.reader.readexactly(4)
-            except Exception:
-                return None
+    elif mtype == "heartbeat":
+        resp = server_msg("heartbeat", session_id=msg.get("session_id"))
+        await ws.send(json.dumps(resp))
 
-        try:
-            payload = await self.reader.readexactly(length)
-        except Exception:
-            return None
+    elif mtype == "task":
+        sid = msg.get("session_id", _id())
+        s.session_id = sid
+        resp = server_msg("task",
+            session_id=sid, task_name=msg.get("task_name", "task"),
+            user_request=msg.get("request", ""),
+        )
+        await ws.send(json.dumps(resp))
 
-        if masked and mask_key:
-            payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+    elif mtype == "command":
+        sid = msg.get("session_id") or s.session_id or _id()
+        s.session_id = sid
+        rid = msg.get("response_id", "")
+        actions = msg.get("actions", [])
+        req_text = msg.get("user_request", "")
 
-        if opcode == 0x8:  # Close
-            return None
-        if opcode == 0x9:  # Ping
-            await self._send_frame(0xA, payload)
-            return await self._read_frame()
+        results = []
+        for act in actions:
+            tool = act.get("tool_name", "")
+            r = await _exec_tool(s, tool, act.get("parameters", {}), req_text)
+            results.append({
+                "status": r["status"],
+                "result": r.get("result"),
+                "error": r.get("error"),
+                "namespace": act.get("tool_type"),
+                "call_id": act.get("call_id"),
+            })
 
-        return payload
+        resp = client_msg("command_results",
+            session_id=sid, action_results=results,
+            prev_response_id=rid,
+        )
+        await ws.send(json.dumps(resp))
 
-    async def _send_text(self, text: str):
-        await self._send_frame(0x1, text.encode("utf-8"))
+    elif mtype == "task_end":
+        if s.task: await s.task.stop(); s.task = None
 
-    async def _send_frame(self, opcode: int, payload: bytes):
-        frame = bytearray()
-        frame.append(0x80 | opcode)
-        plen = len(payload)
-        if plen < 126:
-            frame.append(plen)
-        elif plen < 65536:
-            frame.append(126)
-            frame.extend(plen.to_bytes(2, "big"))
-        else:
-            frame.append(127)
-            frame.extend(plen.to_bytes(8, "big"))
-        frame.extend(payload)
-        try:
-            self.writer.write(bytes(frame))
-            await self.writer.drain()
-        except Exception:
-            pass
 
-    async def _stream_ufo(self):
-        if not self._ufo:
-            return
-        await self._send_text("__START__")
-        buf = ""
-        ansi_strip = re.compile(r"\x1b\[[0-9;]*m")
-        while self._ufo and self._ufo.running:
-            line = self._ufo.readline()
-            if line is None:
-                break
-            clean = ansi_strip.sub("", line).rstrip()
-            if not clean:
-                continue
-            # Skip boring lines
-            if any(skip in clean for skip in [
-                "AuthlibDeprecation", "PydanticDeprecated", "warnings.warn",
-                "PyPDF2", "AgentRegistry", "Cost is not available",
-                "Cost information",
+async def _exec_tool(s: BridgeSession, tool: str, params: dict, req_text: str) -> dict:
+    if tool == "run_task":
+        request = params.get("request", req_text)
+        if not request:
+            return {"status": "failure", "error": "No request provided"}
+        if s.task: await s.task.stop()
+        s.task = UFOTask()
+        await s.task.start(request)
+        lines = []
+        ansi = re.compile(r"\x1b\[[0-9;]*m")
+        while s.task.running:
+            l = await s.task.readline()
+            if l is None: break
+            clean = ansi.sub("", l).rstrip()
+            if clean and not any(x in clean for x in [
+                "AuthlibDeprecation","PydanticDeprecated","warnings.warn",
+                "PyPDF2","AgentRegistry","Cost is not","Cost information",
             ]):
-                continue
-            buf += clean + "\n"
-            if len(buf) > 4096:
-                await self._send_text(buf)
-                buf = ""
-        if buf:
-            await self._send_text(buf)
-        await self._send_text("__DONE__")
+                lines.append(clean)
+        success = any("COMPLETE" in l or "FINISH" in l or "\u2705" in l for l in lines)
+        return {"status": "success" if success else "failure", "result": "\n".join(lines[-30:])}
+    elif tool == "get_status":
+        return {"status": "success", "result": "running" if s.task else "idle"}
+    elif tool == "cancel":
+        if s.task: await s.task.stop(); s.task = None
+        return {"status": "success", "result": "cancelled"}
+    return {"status": "failure", "error": f"Unknown tool: {tool}"}
 
-    @staticmethod
-    def _ws_accept(key: str) -> str:
-        import hashlib, base64
-        GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-        sha1 = hashlib.sha1((key + GUID).encode()).digest()
-        return base64.b64encode(sha1).decode()
+
+async def _handle_legacy(ws, s: BridgeSession, req: str, ansi, noise):
+    if s.task: await s.task.stop()
+    s.task = UFOTask()
+    await s.task.start(req)
+    await ws.send("__START__")
+    buf = ""
+    while s.task and s.task.running:
+        l = s.task.readline()
+        if l is None: break
+        clean = ansi.sub("", l).rstrip()
+        if not clean or any(x in clean for x in noise): continue
+        buf += clean + "\n"
+        if len(buf) > 4096:
+            await ws.send(buf); buf = ""
+    if buf: await ws.send(buf)
+    await ws.send("__DONE__")
+
+
+# ── HTTP (serve HTML) ──
+
+async def http_handler(reader, writer):
+    html_path = Path(__file__).parent.parent / "renderer" / "index.html"
+    if html_path.exists():
+        content = html_path.read_text(encoding="utf-8")
+    else:
+        content = "<h1>UFO2 Bridge</h1><p>Frontend not found.</p>"
+    resp = f"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {len(content.encode('utf-8'))}\r\nConnection: close\r\n\r\n{content}"
+    writer.write(resp.encode()); await writer.drain()
+    writer.close(); await writer.wait_closed()
 
 
 async def main():
     html_path = Path(__file__).parent.parent / "renderer" / "index.html"
     if not html_path.exists():
-        print("Error: bridge/static/index.html not found")
-        return
-    server = await asyncio.start_server(
-        lambda r, w: BridgeProtocol(r, w).handle(),
-        "127.0.0.1", PORT,
+        print(f"Warning: {html_path} not found")
+
+    # WebSocket server
+    ws_server = await websockets.serve(
+        bridge_handler, "127.0.0.1", PORT,
+        ping_interval=None,  # Disable auto-ping to prevent timeouts during UFO execution
+        ping_timeout=None,
+        close_timeout=10,
     )
-    print(f"\n  \u2b21 UFO\u00b2 BRIDGE :{PORT}")
-    print(f"  Open http://localhost:{PORT}\n")
-    async with server:
-        await server.serve_forever()
+    # HTTP server
+    http_server = await asyncio.start_server(http_handler, "127.0.0.1", PORT + 1)
+
+    print(f"  UFO2 BRIDGE ws://127.0.0.1:{PORT}  [AIP device endpoint]")
+    print(f"  Device ID: {DEVICE_ID}")
+    print(f"  UI: http://127.0.0.1:{PORT+1}")
+
+    await asyncio.gather(
+        asyncio.create_task(ws_server.wait_closed()),
+        http_server.serve_forever(),
+    )
+
 
 if __name__ == "__main__":
     asyncio.run(main())
